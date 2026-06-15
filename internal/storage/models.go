@@ -36,3 +36,23 @@ type Step struct {
 	StderrBytesObserved int64
 	CreatedAt           time.Time
 }
+
+type Message struct {
+	ID        int64
+	SessionID int64
+	RunID     int64
+	Role      string
+	Content   string
+	CreatedAt time.Time
+}
+
+type ProviderConfig struct {
+	BaseURL string
+	Model   string
+	APIKey  string
+}
+
+type SearchConfig struct {
+	Enabled      bool
+	TavilyAPIKey string
+}

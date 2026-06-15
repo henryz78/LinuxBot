@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LinuxBot</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="mark">LB</span>
+        <h1>LinuxBot</h1>
+      </div>
+      <label>
+        <span>Session</span>
+        <select id="session"></select>
+      </label>
+      <label>
+        <span>Mode</span>
+        <select id="mode">
+          <option value="safe">safe</option>
+          <option value="review">review</option>
+          <option value="open">open</option>
+        </select>
+      </label>
+      <div id="connection" class="status">Connecting</div>
+    </aside>
+    <section class="workspace">
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="ask" class="composer">
+        <textarea id="prompt" rows="3" aria-label="输入服务器管理请求" placeholder="输入服务器管理请求"></textarea>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

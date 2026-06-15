@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
@@ -22,6 +23,9 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if path != ":memory:" {
+		_ = os.Chmod(path, 0600)
+	}
 	return store, nil
 }
 
@@ -35,6 +39,7 @@ func (s *Store) migrate() error {
 		`PRAGMA busy_timeout=5000`,
 		`PRAGMA journal_mode=WAL`,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
+		`CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT NOT NULL UNIQUE,
@@ -54,6 +59,7 @@ func (s *Store) migrate() error {
 		`CREATE TABLE IF NOT EXISTS messages (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id INTEGER NOT NULL,
+			run_id INTEGER NOT NULL DEFAULT 0,
 			role TEXT NOT NULL,
 			content TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -125,5 +131,34 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
+	if err := s.ensureColumn("messages", "run_id", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(table string, column string, definition string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
