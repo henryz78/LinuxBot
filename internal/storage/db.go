@@ -16,6 +16,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	store := &Store{db: db}
 	if err := store.migrate(); err != nil {
 		db.Close()
@@ -30,6 +31,8 @@ func (s *Store) Close() error {
 
 func (s *Store) migrate() error {
 	statements := []string{
+		`PRAGMA foreign_keys=ON`,
+		`PRAGMA busy_timeout=5000`,
 		`PRAGMA journal_mode=WAL`,
 		`CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)`,
 		`CREATE TABLE IF NOT EXISTS sessions (

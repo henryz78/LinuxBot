@@ -2,20 +2,14 @@ package storage
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"time"
 )
 
 func (s *Store) EnsureDefaultSession(ctx context.Context, workingDir string) (Session, error) {
-	session, err := s.GetSessionByName(ctx, "default")
-	if err == nil {
-		return session, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
+	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO sessions(name, working_directory) VALUES('default', ?)`, workingDir); err != nil {
 		return Session{}, err
 	}
-	return s.CreateSession(ctx, "default", workingDir)
+	return s.GetSessionByName(ctx, "default")
 }
 
 func (s *Store) CreateSession(ctx context.Context, name string, workingDir string) (Session, error) {
@@ -49,7 +43,12 @@ func (s *Store) CreateRun(ctx context.Context, sessionID int64, prompt string) (
 	if err != nil {
 		return Run{}, err
 	}
-	return Run{ID: id, SessionID: sessionID, Prompt: prompt, Status: "running"}, nil
+	return s.GetRun(ctx, id)
+}
+
+func (s *Store) GetRun(ctx context.Context, id int64) (Run, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, session_id, prompt, status, created_at, updated_at FROM runs WHERE id = ?`, id)
+	return scanRun(row)
 }
 
 func (s *Store) AddStep(ctx context.Context, step Step) error {
@@ -77,11 +76,11 @@ func (s *Store) ListRunSteps(ctx context.Context, runID int64) ([]Step, error) {
 	return steps, rows.Err()
 }
 
-type sessionScanner interface {
+type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-func scanSession(row sessionScanner) (Session, error) {
+func scanSession(row rowScanner) (Session, error) {
 	var session Session
 	var lastUsed, created, updated string
 	if err := row.Scan(&session.ID, &session.Name, &session.Description, &session.Mode, &session.WorkingDirectory, &lastUsed, &created, &updated); err != nil {
@@ -91,6 +90,17 @@ func scanSession(row sessionScanner) (Session, error) {
 	session.CreatedAt = parseTime(created)
 	session.UpdatedAt = parseTime(updated)
 	return session, nil
+}
+
+func scanRun(row rowScanner) (Run, error) {
+	var run Run
+	var created, updated string
+	if err := row.Scan(&run.ID, &run.SessionID, &run.Prompt, &run.Status, &created, &updated); err != nil {
+		return Run{}, err
+	}
+	run.CreatedAt = parseTime(created)
+	run.UpdatedAt = parseTime(updated)
+	return run, nil
 }
 
 func parseTime(value string) time.Time {
