@@ -60,13 +60,14 @@ func (a *Agent) RunResult(ctx context.Context, session storage.Session, prompt s
 	for i := 0; i < 4; i++ {
 		response, err := a.provider.Chat(ctx, provider.ChatRequest{Messages: messages})
 		if err != nil {
-			_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
+			_ = a.failRun(ctx, session, run.ID, prompt, err)
 			return RunResult{RunID: run.ID}, err
 		}
 		var model ModelResponse
 		if err := json.Unmarshal([]byte(response.Content), &model); err != nil {
-			_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-			return RunResult{RunID: run.ID}, fmt.Errorf("parse model response: %w", err)
+			parseErr := fmt.Errorf("parse model response: %w", err)
+			_ = a.failRun(ctx, session, run.ID, prompt, parseErr)
+			return RunResult{RunID: run.ID}, parseErr
 		}
 		if model.Plan != "" {
 			if err := a.store.AddStep(ctx, storage.Step{RunID: run.ID, Kind: "plan", Status: "done", Output: model.Plan}); err != nil {
@@ -98,7 +99,7 @@ func (a *Agent) RunResult(ctx context.Context, session storage.Session, prompt s
 			a.emitAction(action)
 			result, err := a.router.Execute(ctx, tool.ToolRequest{Name: action.Tool, Input: action.Input})
 			if err != nil {
-				_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
+				_ = a.failRun(ctx, session, run.ID, prompt, err)
 				return RunResult{RunID: run.ID}, err
 			}
 			step := storage.Step{
@@ -149,8 +150,9 @@ func (a *Agent) RunResult(ctx context.Context, session storage.Session, prompt s
 		messages = append(messages, provider.Message{Role: provider.RoleAssistant, Content: response.Content})
 		messages = append(messages, provider.Message{Role: provider.RoleUser, Content: "Tool observations:\n" + observation.String()})
 	}
-	_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-	return RunResult{RunID: run.ID}, fmt.Errorf("agent exceeded action loop limit")
+	loopErr := fmt.Errorf("agent exceeded action loop limit")
+	_ = a.failRun(ctx, session, run.ID, prompt, loopErr)
+	return RunResult{RunID: run.ID}, loopErr
 }
 
 func (a *Agent) emit(format string, args ...any) {
@@ -239,6 +241,20 @@ func (a *Agent) updateSummary(ctx context.Context, session storage.Session, prom
 		combined = combined[len(combined)-4000:]
 	}
 	return a.store.SetSessionSummary(ctx, session.ID, strings.TrimSpace(combined))
+}
+
+func (a *Agent) failRun(ctx context.Context, session storage.Session, runID int64, prompt string, cause error) error {
+	answer := "执行失败：" + cause.Error()
+	if err := a.store.AddStep(ctx, storage.Step{RunID: runID, Kind: "answer", Status: "failed", Output: answer, ErrorText: cause.Error()}); err != nil {
+		return err
+	}
+	if err := a.store.AddMessage(ctx, session.ID, runID, "assistant", answer); err != nil {
+		return err
+	}
+	if err := a.updateSummary(ctx, session, prompt, answer); err != nil {
+		return err
+	}
+	return a.store.UpdateRunStatus(ctx, runID, "failed")
 }
 
 func compact(value string, limit int) string {

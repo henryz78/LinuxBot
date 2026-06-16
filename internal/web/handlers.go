@@ -123,7 +123,20 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 	}
 	answer, err := s.options.Ask(r.Context(), session, request.Prompt)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		if answer.RunID != 0 {
+			run, runErr := s.options.Store.GetRun(r.Context(), answer.RunID)
+			if runErr == nil {
+				view, viewErr := s.runView(r.Context(), run)
+				if viewErr == nil {
+					writeJSONStatus(w, http.StatusInternalServerError, map[string]any{
+						"error": err.Error(),
+						"run":   view,
+					})
+					return
+				}
+			}
+		}
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	run, err := s.options.Store.GetRun(r.Context(), answer.RunID)
@@ -304,4 +317,14 @@ func (s *Server) runView(ctx context.Context, run storage.Run) (RunView, error) 
 func writeJSON(w http.ResponseWriter, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONStatus(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeJSONError(w http.ResponseWriter, status int, message string) {
+	writeJSONStatus(w, status, map[string]string{"error": message})
 }

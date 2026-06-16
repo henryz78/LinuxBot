@@ -97,6 +97,10 @@ function createAssistantMessage(run, group) {
   deleteButton.className = 'secondary danger';
   deleteButton.textContent = '删除';
   deleteButton.addEventListener('click', async () => {
+    if (typeof runId(run) !== 'number') {
+      group.remove();
+      return;
+    }
     await fetch('/api/delete-run', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -114,8 +118,16 @@ function createAssistantMessage(run, group) {
 }
 
 async function loadRunDetails(run, trace, group, article) {
+  if (typeof runId(run) !== 'number') {
+    renderTraceError(trace, run.answer || '发送失败');
+    return;
+  }
   const response = await fetch(`/api/runs/${runId(run)}?session_id=${sessionId(run)}`);
-  const steps = await response.json();
+  const steps = await readJSON(response);
+  if (!response.ok || !Array.isArray(steps)) {
+    renderTraceError(trace, errorMessage(steps, response));
+    return;
+  }
   renderSteps(steps, trace, group, article);
 }
 
@@ -165,6 +177,39 @@ function renderSteps(steps, trace, group, article) {
     }
     trace.appendChild(item);
   }
+}
+
+function renderTraceError(trace, message) {
+  trace.innerHTML = '';
+  const item = document.createElement('section');
+  item.className = 'step';
+  const title = document.createElement('div');
+  title.className = 'step-title status-failed';
+  title.textContent = '错误';
+  const pre = document.createElement('pre');
+  pre.textContent = message;
+  item.appendChild(title);
+  item.appendChild(pre);
+  trace.appendChild(item);
+}
+
+async function readJSON(response) {
+  const text = await response.text();
+  if (!text) {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return {error: text};
+  }
+}
+
+function errorMessage(data, response) {
+  if (data && data.error) {
+    return data.error;
+  }
+  return `HTTP ${response.status}`;
 }
 
 function stepLabel(kind) {
@@ -222,7 +267,18 @@ document.querySelector('#ask').addEventListener('submit', async event => {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({session_id: state.sessionId, prompt})
     });
-    const data = await response.json();
+    const data = await readJSON(response);
+    if (!response.ok && !(data && data.run)) {
+      appendRun({
+        id: `error-${Date.now()}`,
+        session_id: state.sessionId,
+        prompt,
+        answer: `发送失败：${errorMessage(data, response)}`,
+        summary: '已处理 0 个步骤',
+        status: 'failed'
+      });
+      return;
+    }
     appendRun(data.run || {
       id: data.run_id,
       session_id: state.sessionId,
