@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+var ErrStepNotPendingApproval = errors.New("step is not pending approval")
+
 func (s *Store) EnsureDefaultSession(ctx context.Context, workingDir string) (Session, error) {
 	if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO sessions(name, working_directory) VALUES('default', ?)`, workingDir); err != nil {
 		return Session{}, err
@@ -140,6 +142,56 @@ func (s *Store) ListRunSteps(ctx context.Context, runID int64) ([]Step, error) {
 func (s *Store) GetStep(ctx context.Context, stepID int64) (Step, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, run_id, kind, status, input, output, error_text, exit_code, duration_millis, stdout_bytes_observed, stderr_bytes_observed, created_at FROM steps WHERE id = ?`, stepID)
 	return scanStep(row)
+}
+
+func (s *Store) ClaimStepForApproval(ctx context.Context, stepID int64) (Step, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Step{}, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE steps SET status = 'running' WHERE id = ? AND status = 'approval_required'`, stepID)
+	if err != nil {
+		return Step{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return Step{}, err
+	}
+	if affected == 0 {
+		return Step{}, ErrStepNotPendingApproval
+	}
+	step, err := scanStep(tx.QueryRowContext(ctx, `SELECT id, run_id, kind, status, input, output, error_text, exit_code, duration_millis, stdout_bytes_observed, stderr_bytes_observed, created_at FROM steps WHERE id = ?`, stepID))
+	if err != nil {
+		return Step{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Step{}, err
+	}
+	return step, nil
+}
+
+func (s *Store) RunHasPendingApprovals(ctx context.Context, runID int64) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM steps WHERE run_id = ? AND kind = 'command' AND status IN ('approval_required', 'running')`, runID).Scan(&count)
+	return count > 0, err
+}
+
+func (s *Store) UpdateWaitingApprovalAnswer(ctx context.Context, runID int64, answer string) error {
+	result, err := s.db.ExecContext(ctx, `UPDATE steps SET status = 'done', output = ? WHERE id = (
+		SELECT id FROM steps WHERE run_id = ? AND kind = 'answer' AND status = 'waiting_approval' ORDER BY id DESC LIMIT 1
+	)`, answer, runID)
+	if err != nil {
+		return err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return s.AddStep(ctx, Step{RunID: runID, Kind: "answer", Status: "done", Output: answer})
+	}
+	return nil
 }
 
 func (s *Store) AddMessage(ctx context.Context, sessionID int64, runID int64, role string, content string) error {

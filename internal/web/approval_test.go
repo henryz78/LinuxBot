@@ -28,8 +28,17 @@ func TestApproveEndpointExecutesPendingCommand(t *testing.T) {
 	if err := store.AddStep(context.Background(), storage.Step{RunID: run.ID, Kind: "command", Status: "approval_required", Input: "echo ok"}); err != nil {
 		t.Fatalf("AddStep: %v", err)
 	}
+	if err := store.AddStep(context.Background(), storage.Step{RunID: run.ID, Kind: "answer", Status: "waiting_approval", Output: "waiting"}); err != nil {
+		t.Fatalf("AddStep waiting answer: %v", err)
+	}
 	server := NewServer(Options{Store: store, ApproveCommand: func(ctx context.Context, session storage.Session, step storage.Step) error {
-		return store.AddStep(ctx, storage.Step{RunID: step.RunID, Kind: "command", Status: "done", Input: step.Input, Output: "ok\n"})
+		if err := store.UpdateStepResult(ctx, storage.Step{ID: step.ID, Status: "done", Output: "ok\n"}); err != nil {
+			return err
+		}
+		if err := store.UpdateWaitingApprovalAnswer(ctx, step.RunID, "approved output"); err != nil {
+			return err
+		}
+		return store.UpdateRunStatus(ctx, step.RunID, "done")
 	}})
 	body := strings.NewReader(`{"session_id":` + strconv.FormatInt(session.ID, 10) + `,"step_id":1}`)
 	recorder := httptest.NewRecorder()
@@ -42,8 +51,28 @@ func TestApproveEndpointExecutesPendingCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetStep: %v", err)
 	}
-	if step.Status != "approved" {
+	if step.Status != "done" {
 		t.Fatalf("approved step status = %s", step.Status)
+	}
+	steps, err := store.ListRunSteps(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("ListRunSteps: %v", err)
+	}
+	var commandSteps int
+	var finalAnswer string
+	for _, item := range steps {
+		if item.Kind == "command" {
+			commandSteps++
+		}
+		if item.Kind == "answer" {
+			finalAnswer = item.Output
+		}
+	}
+	if commandSteps != 1 {
+		t.Fatalf("command steps = %d", commandSteps)
+	}
+	if finalAnswer != "approved output" {
+		t.Fatalf("final answer = %q", finalAnswer)
 	}
 	storedRun, err := store.GetRun(context.Background(), run.ID)
 	if err != nil {

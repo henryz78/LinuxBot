@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -171,6 +172,34 @@ func TestStoreEnforcesStepForeignKeys(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("AddStep with missing run succeeded")
+	}
+}
+
+func TestClaimStepForApprovalOnlySucceedsOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	session, err := store.EnsureDefaultSession(ctx, "/srv/app")
+	if err != nil {
+		t.Fatalf("EnsureDefaultSession: %v", err)
+	}
+	run, err := store.CreateRun(ctx, session.ID, "approve")
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if err := store.AddStep(ctx, Step{RunID: run.ID, Kind: "command", Status: "approval_required", Input: "echo ok"}); err != nil {
+		t.Fatalf("AddStep: %v", err)
+	}
+
+	claimed, err := store.ClaimStepForApproval(ctx, 1)
+	if err != nil {
+		t.Fatalf("ClaimStepForApproval first: %v", err)
+	}
+	if claimed.Status != "running" {
+		t.Fatalf("claimed status = %s", claimed.Status)
+	}
+	_, err = store.ClaimStepForApproval(ctx, 1)
+	if !errors.Is(err, ErrStepNotPendingApproval) {
+		t.Fatalf("second claim err = %v", err)
 	}
 }
 

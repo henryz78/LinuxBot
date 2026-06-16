@@ -1,7 +1,10 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -11,6 +14,7 @@ import (
 func (s *Server) routes() {
 	s.mux.HandleFunc("/api/health", s.handleHealth)
 	s.mux.HandleFunc("/api/sessions", s.handleSessions)
+	s.mux.HandleFunc("/api/history", s.handleHistory)
 	s.mux.HandleFunc("/api/mode", s.handleMode)
 	s.mux.HandleFunc("/api/ask", s.handleAsk)
 	s.mux.HandleFunc("/api/runs/", s.handleRun)
@@ -34,6 +38,37 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, sessions)
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		http.Error(w, "store is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	sessionID, err := strconv.ParseInt(r.URL.Query().Get("session_id"), 10, 64)
+	if err != nil || sessionID <= 0 {
+		http.Error(w, "invalid session_id", http.StatusBadRequest)
+		return
+	}
+	runs, err := s.options.Store.ListRecentRuns(r.Context(), sessionID, 50)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	views := make([]RunView, 0, len(runs))
+	for i := len(runs) - 1; i >= 0; i-- {
+		view, err := s.runView(r.Context(), runs[i])
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		views = append(views, view)
+	}
+	writeJSON(w, views)
 }
 
 func (s *Server) handleMode(w http.ResponseWriter, r *http.Request) {
@@ -91,9 +126,20 @@ func (s *Server) handleAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	run, err := s.options.Store.GetRun(r.Context(), answer.RunID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	view, err := s.runView(r.Context(), run)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, map[string]any{
 		"answer": answer.Text,
 		"run_id": answer.RunID,
+		"run":    view,
 		"summary": "已处理 " + strconv.Itoa(answer.StepCount) + " 个步骤 · " +
 			strconv.FormatInt(answer.DurationMillis, 10) + "ms",
 	})
@@ -108,6 +154,16 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 	runID, err := strconv.ParseInt(idText, 10, 64)
 	if err != nil {
 		http.Error(w, "invalid run id", http.StatusBadRequest)
+		return
+	}
+	sessionID, err := strconv.ParseInt(r.URL.Query().Get("session_id"), 10, 64)
+	if err != nil || sessionID <= 0 {
+		http.Error(w, "invalid session_id", http.StatusBadRequest)
+		return
+	}
+	run, err := s.options.Store.GetRun(r.Context(), runID)
+	if err != nil || run.SessionID != sessionID {
+		http.Error(w, "run not found", http.StatusNotFound)
 		return
 	}
 	steps, err := s.options.Store.ListRunSteps(r.Context(), runID)
@@ -179,6 +235,10 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.options.ApproveCommand(r.Context(), session, step); err != nil {
+		if errors.Is(err, storage.ErrStepNotPendingApproval) {
+			http.Error(w, "step is not pending approval", http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -188,17 +248,57 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if updated.Status == "approval_required" {
-		updated.Status = "approved"
-		if err := s.options.Store.UpdateStepResult(r.Context(), updated); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+		http.Error(w, "approval did not execute the command", http.StatusInternalServerError)
+		return
 	}
-	if err := s.options.Store.UpdateRunStatus(r.Context(), step.RunID, "done"); err != nil {
+	updatedRun, err := s.options.Store.GetRun(r.Context(), step.RunID)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	view, err := s.runView(r.Context(), updatedRun)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, view)
+}
+
+func (s *Server) runView(ctx context.Context, run storage.Run) (RunView, error) {
+	steps, err := s.options.Store.ListRunSteps(ctx, run.ID)
+	if err != nil {
+		return RunView{}, err
+	}
+	answer := ""
+	var duration int64
+	for _, step := range steps {
+		duration += step.DurationMillis
+		if step.Kind == "answer" {
+			answer = step.Output
+		}
+	}
+	if answer == "" {
+		switch run.Status {
+		case "waiting_approval":
+			answer = "有命令需要批准后才能继续执行。"
+		case "failed":
+			answer = "执行失败。"
+		default:
+			answer = "处理中。"
+		}
+	}
+	return RunView{
+		ID:             run.ID,
+		SessionID:      run.SessionID,
+		Prompt:         run.Prompt,
+		Status:         run.Status,
+		Answer:         answer,
+		Summary:        fmt.Sprintf("已处理 %d 个步骤 · %dms", len(steps), duration),
+		StepCount:      len(steps),
+		DurationMillis: duration,
+		CreatedAt:      run.CreatedAt,
+		UpdatedAt:      run.UpdatedAt,
+	}, nil
 }
 
 func writeJSON(w http.ResponseWriter, value any) {

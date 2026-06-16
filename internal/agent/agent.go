@@ -25,6 +25,11 @@ type Agent struct {
 	options  Options
 }
 
+type RunResult struct {
+	Text  string
+	RunID int64
+}
+
 func New(store *storage.Store, provider provider.Provider, router *tool.Router, options Options) *Agent {
 	if options.ApprovalSource == "" {
 		options.ApprovalSource = "cli"
@@ -33,31 +38,39 @@ func New(store *storage.Store, provider provider.Provider, router *tool.Router, 
 }
 
 func (a *Agent) Run(ctx context.Context, session storage.Session, prompt string) (string, error) {
-	messages, err := contextmgr.Build(ctx, a.store, session, prompt)
+	result, err := a.RunResult(ctx, session, prompt)
 	if err != nil {
 		return "", err
+	}
+	return result.Text, nil
+}
+
+func (a *Agent) RunResult(ctx context.Context, session storage.Session, prompt string) (RunResult, error) {
+	messages, err := contextmgr.Build(ctx, a.store, session, prompt)
+	if err != nil {
+		return RunResult{}, err
 	}
 	run, err := a.store.CreateRun(ctx, session.ID, prompt)
 	if err != nil {
-		return "", err
+		return RunResult{}, err
 	}
 	if err := a.store.AddMessage(ctx, session.ID, run.ID, "user", prompt); err != nil {
-		return "", err
+		return RunResult{RunID: run.ID}, err
 	}
 	for i := 0; i < 4; i++ {
 		response, err := a.provider.Chat(ctx, provider.ChatRequest{Messages: messages})
 		if err != nil {
 			_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-			return "", err
+			return RunResult{RunID: run.ID}, err
 		}
 		var model ModelResponse
 		if err := json.Unmarshal([]byte(response.Content), &model); err != nil {
 			_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-			return "", fmt.Errorf("parse model response: %w", err)
+			return RunResult{RunID: run.ID}, fmt.Errorf("parse model response: %w", err)
 		}
 		if model.Plan != "" {
 			if err := a.store.AddStep(ctx, storage.Step{RunID: run.ID, Kind: "plan", Status: "done", Output: model.Plan}); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			a.emit("AI plan:\n%s\n", model.Plan)
 		}
@@ -67,16 +80,16 @@ func (a *Agent) Run(ctx context.Context, session storage.Session, prompt string)
 				answer = "完成。"
 			}
 			if err := a.store.AddStep(ctx, storage.Step{RunID: run.ID, Kind: "answer", Status: "done", Output: answer}); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			if err := a.store.AddMessage(ctx, session.ID, run.ID, "assistant", answer); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			if err := a.updateSummary(ctx, session, prompt, answer); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			_ = a.store.UpdateRunStatus(ctx, run.ID, "done")
-			return answer, nil
+			return RunResult{Text: answer, RunID: run.ID}, nil
 		}
 
 		var observation strings.Builder
@@ -86,7 +99,7 @@ func (a *Agent) Run(ctx context.Context, session storage.Session, prompt string)
 			result, err := a.router.Execute(ctx, tool.ToolRequest{Name: action.Tool, Input: action.Input})
 			if err != nil {
 				_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			step := storage.Step{
 				RunID:               run.ID,
@@ -101,15 +114,15 @@ func (a *Agent) Run(ctx context.Context, session storage.Session, prompt string)
 				StderrBytesObserved: result.StderrBytesObserved,
 			}
 			if err := a.store.AddStep(ctx, step); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			if result.ApprovalDecision != "" {
 				if err := a.store.AddApproval(ctx, session.ID, run.ID, result.Command, string(result.ApprovalDecision), a.options.ApprovalSource); err != nil {
-					return "", err
+					return RunResult{RunID: run.ID}, err
 				}
 				if result.ApprovalDecision == tool.ApprovalAlways {
 					if err := a.store.AddAlwaysApproveRule(ctx, session.ID, result.Command); err != nil {
-						return "", err
+						return RunResult{RunID: run.ID}, err
 					}
 				}
 			}
@@ -122,22 +135,22 @@ func (a *Agent) Run(ctx context.Context, session storage.Session, prompt string)
 		if waitingApproval {
 			answer := "有命令需要批准后才能继续执行。"
 			if err := a.store.AddStep(ctx, storage.Step{RunID: run.ID, Kind: "answer", Status: "waiting_approval", Output: answer}); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			if err := a.store.AddMessage(ctx, session.ID, run.ID, "assistant", answer); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			if err := a.updateSummary(ctx, session, prompt, answer); err != nil {
-				return "", err
+				return RunResult{RunID: run.ID}, err
 			}
 			_ = a.store.UpdateRunStatus(ctx, run.ID, "waiting_approval")
-			return answer, nil
+			return RunResult{Text: answer, RunID: run.ID}, nil
 		}
 		messages = append(messages, provider.Message{Role: provider.RoleAssistant, Content: response.Content})
 		messages = append(messages, provider.Message{Role: provider.RoleUser, Content: "Tool observations:\n" + observation.String()})
 	}
 	_ = a.store.UpdateRunStatus(ctx, run.ID, "failed")
-	return "", fmt.Errorf("agent exceeded action loop limit")
+	return RunResult{RunID: run.ID}, fmt.Errorf("agent exceeded action loop limit")
 }
 
 func (a *Agent) emit(format string, args ...any) {

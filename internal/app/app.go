@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"linuxbot/internal/agent"
@@ -126,11 +127,11 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 				if err != nil {
 					return web.Answer{}, err
 				}
-				text, err := bot.Run(ctx, session, prompt)
+				result, err := bot.RunResult(ctx, session, prompt)
 				if err != nil {
 					return web.Answer{}, err
 				}
-				run, err := store.LatestRun(ctx, session.ID)
+				run, err := store.GetRun(ctx, result.RunID)
 				if err != nil {
 					return web.Answer{}, err
 				}
@@ -138,54 +139,10 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 				if err != nil {
 					return web.Answer{}, err
 				}
-				return web.Answer{Text: text, RunID: run.ID, StepCount: len(steps), DurationMillis: time.Since(start).Milliseconds()}, nil
+				return web.Answer{Text: result.Text, RunID: run.ID, StepCount: len(steps), DurationMillis: time.Since(start).Milliseconds()}, nil
 			},
 			ApproveCommand: func(ctx context.Context, session storage.Session, step storage.Step) error {
-				shell := tool.NewShellTool(tool.ShellOptions{
-					Mode:             policy.ModeReview,
-					WorkingDirectory: session.WorkingDirectory,
-					OutputLimitBytes: 4 * 1024 * 1024,
-					Approve: func(ctx context.Context, req tool.ApprovalRequest) (tool.ApprovalDecision, error) {
-						return tool.ApprovalApprove, nil
-					},
-				})
-				result, err := shell.Execute(ctx, tool.ToolRequest{Name: "shell", Input: map[string]string{"command": step.Input}})
-				if err != nil {
-					return err
-				}
-				if err := store.AddApproval(ctx, session.ID, step.RunID, result.Command, string(tool.ApprovalApprove), "web"); err != nil {
-					return err
-				}
-				if err := store.UpdateStepResult(ctx, storage.Step{
-					ID:                  step.ID,
-					Status:              "approved",
-					Output:              result.Stdout,
-					ErrorText:           result.ErrorText,
-					ExitCode:            result.ExitCode,
-					DurationMillis:      result.DurationMillis,
-					StdoutBytesObserved: result.StdoutBytesObserved,
-					StderrBytesObserved: result.StderrBytesObserved,
-				}); err != nil {
-					return err
-				}
-				if err := store.AddStep(ctx, storage.Step{
-					RunID:               step.RunID,
-					Kind:                "command",
-					Status:              result.Status,
-					Input:               step.Input,
-					Output:              result.Stdout,
-					ErrorText:           result.ErrorText,
-					ExitCode:            result.ExitCode,
-					DurationMillis:      result.DurationMillis,
-					StdoutBytesObserved: result.StdoutBytesObserved,
-					StderrBytesObserved: result.StderrBytesObserved,
-				}); err != nil {
-					return err
-				}
-				if err := store.AddStep(ctx, storage.Step{RunID: step.RunID, Kind: "answer", Status: "done", Output: "命令已批准并执行。"}); err != nil {
-					return err
-				}
-				return store.UpdateRunStatus(ctx, step.RunID, "done")
+				return approveWebCommand(ctx, store, session, step)
 			},
 		})
 		_, _ = fmt.Fprintln(stdout, "LinuxBot Web listening on http://127.0.0.1:8787")
@@ -193,6 +150,101 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer, 
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func approveWebCommand(ctx context.Context, store *storage.Store, session storage.Session, step storage.Step) error {
+	claimed, err := store.ClaimStepForApproval(ctx, step.ID)
+	if err != nil {
+		return err
+	}
+	shell := tool.NewShellTool(tool.ShellOptions{
+		Mode:             policy.ModeReview,
+		WorkingDirectory: session.WorkingDirectory,
+		OutputLimitBytes: 4 * 1024 * 1024,
+		Approve: func(ctx context.Context, req tool.ApprovalRequest) (tool.ApprovalDecision, error) {
+			return tool.ApprovalApprove, nil
+		},
+	})
+	result, err := shell.Execute(ctx, tool.ToolRequest{Name: "shell", Input: map[string]string{"command": claimed.Input}})
+	if err != nil {
+		_ = store.UpdateStepResult(ctx, storage.Step{ID: claimed.ID, Status: "failed", ErrorText: err.Error(), ExitCode: 1})
+		return err
+	}
+	if err := store.AddApproval(ctx, session.ID, claimed.RunID, result.Command, string(tool.ApprovalApprove), "web"); err != nil {
+		return err
+	}
+	output := toolResultOutput(result)
+	if err := store.UpdateStepResult(ctx, storage.Step{
+		ID:                  claimed.ID,
+		Status:              result.Status,
+		Output:              output,
+		ErrorText:           result.ErrorText,
+		ExitCode:            result.ExitCode,
+		DurationMillis:      result.DurationMillis,
+		StdoutBytesObserved: result.StdoutBytesObserved,
+		StderrBytesObserved: result.StderrBytesObserved,
+	}); err != nil {
+		return err
+	}
+	hasPending, err := store.RunHasPendingApprovals(ctx, claimed.RunID)
+	if err != nil {
+		return err
+	}
+	if hasPending && result.Status == "done" {
+		return store.UpdateRunStatus(ctx, claimed.RunID, "waiting_approval")
+	}
+	runStatus := "done"
+	if result.Status != "done" {
+		runStatus = "failed"
+	}
+	answer := approvedCommandAnswer(result, output)
+	if err := store.UpdateWaitingApprovalAnswer(ctx, claimed.RunID, answer); err != nil {
+		return err
+	}
+	if err := store.AddMessage(ctx, session.ID, claimed.RunID, "assistant", answer); err != nil {
+		return err
+	}
+	return store.UpdateRunStatus(ctx, claimed.RunID, runStatus)
+}
+
+func approvedCommandAnswer(result tool.ToolResult, output string) string {
+	if result.Status == "done" {
+		return "命令已批准并执行完成。展开执行过程可以查看输出。"
+	}
+	visibleOutput := trimForAnswer(strings.TrimSpace(output), 1200)
+	var builder strings.Builder
+	builder.WriteString("命令已批准，但执行结果为 ")
+	builder.WriteString(result.Status)
+	builder.WriteString("。")
+	if result.ErrorText != "" {
+		builder.WriteString("\n\n错误：")
+		builder.WriteString(result.ErrorText)
+	}
+	if visibleOutput != "" {
+		builder.WriteString("\n\n输出：\n")
+		builder.WriteString(visibleOutput)
+	}
+	return builder.String()
+}
+
+func toolResultOutput(result tool.ToolResult) string {
+	if result.Output != "" {
+		return result.Output
+	}
+	if result.Stdout != "" && result.Stderr != "" {
+		return result.Stdout + "\n[stderr]\n" + result.Stderr
+	}
+	if result.Stdout != "" {
+		return result.Stdout
+	}
+	return result.Stderr
+}
+
+func trimForAnswer(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "\n[output truncated]"
 }
 
 func parseSessionArg(args []string) ([]string, string, error) {

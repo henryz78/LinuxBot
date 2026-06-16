@@ -5,6 +5,7 @@ import (
 	"embed"
 	"io/fs"
 	"net/http"
+	"time"
 
 	"linuxbot/internal/storage"
 )
@@ -21,6 +22,19 @@ type Answer struct {
 	RunID          int64
 	StepCount      int
 	DurationMillis int64
+}
+
+type RunView struct {
+	ID             int64     `json:"id"`
+	SessionID      int64     `json:"session_id"`
+	Prompt         string    `json:"prompt"`
+	Status         string    `json:"status"`
+	Answer         string    `json:"answer"`
+	Summary        string    `json:"summary"`
+	StepCount      int       `json:"step_count"`
+	DurationMillis int64     `json:"duration_millis"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type Options struct {
